@@ -1,0 +1,379 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+
+% Define colors for code
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+% Code listing style
+\lstset{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=true,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    frame=single,
+    rulecolor=\color{black},
+    tabsize=4,
+    language=Go
+}
+
+\title{Detailed Report on MapReduce Implementation}
+\author{Mohamad Saeed sedighi - 810100179\\Mohamad Hosein Motaee - 810199493\\Mahdi}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+The report is structured to include a detailed examination of each file's code, an explanation of its functionality, and an analysis of the test output from running the \texttt{Test} script, as depicted in the attached image.
+
+\section{Code Analysis}
+
+\subsection{coordinator.go}
+\begin{lstlisting}
+package mr
+
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
+
+type Coordinator struct {
+	mu          sync.Mutex
+	mapTasks    []Task
+	reduceTasks []Task
+	mapDone     bool
+	reduceDone  bool
+	nReduce     int
+	nMap        int
+	tasks       map[int]*TaskTracker
+}
+
+type TaskTracker struct {
+	Status    TaskState
+	WorkerId  string
+	StartTime time.Time
+}
+
+func (c *Coordinator) server() {
+	rpc.Register(c)
+	rpc.HandleHTTP()
+	sockname := coordinatorSock()
+	os.Remove(sockname)
+	l, e := net.Listen("unix", sockname)
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	go http.Serve(l, nil)
+}
+
+func (c *Coordinator) monitor() {
+	for {
+		c.mu.Lock()
+		if c.Done() {
+			c.mu.Unlock()
+			return
+		}
+		
+		now := time.Now()
+		for _, tracker := range c.tasks {
+			if tracker.Status == InProgress && now.Sub(tracker.StartTime) > 10*time.Second {
+				tracker.Status = Pending
+				tracker.WorkerId = ""
+				tracker.StartTime = time.Time{}
+			}
+		}
+		c.mu.Unlock()
+		time.Sleep(time.Second)
+	}
+}
+
+func (c *Coordinator) Done() bool {
+	return c.mapDone && c.reduceDone
+}
+
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	c := Coordinator{
+		mapTasks:    make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
+		tasks:       map[int]*TaskTracker{},
+		nReduce:     nReduce,
+		nMap:        len(files),
+	}
+
+	for i, file := range files {
+		c.mapTasks[i] = Task{Map, i, file, nReduce, len(files)}
+		c.tasks[i] = &TaskTracker{Pending, "", time.Time{}}
+	}
+
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[i] = Task{Reduce, i, "", nReduce, len(files)}
+		c.tasks[len(files)+i] = &TaskTracker{Pending, "", time.Time{}}
+	}
+
+	go c.monitor()
+	c.server()
+	return &c
+}
+
+func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.mapDone {
+		for i, task := range c.mapTasks {
+			if c.tasks[i].Status == Pending {
+				c.tasks[i].Status = InProgress
+				c.tasks[i].WorkerId = args.WorkerId
+				c.tasks[i].StartTime = time.Now()
+				reply.Task = task
+				return nil
+			}
+		}
+		c.mapDone = true
+		for i := 0; i < c.nMap; i++ {
+			if c.tasks[i].Status != Completed {
+				c.mapDone = false
+				break
+			}
+		}
+	}
+
+	if c.mapDone && !c.reduceDone {
+		for i, task := range c.reduceTasks {
+			taskId := c.nMap + i
+			if c.tasks[taskId].Status == Pending {
+				c.tasks[taskId].Status = InProgress
+				c.tasks[taskId].WorkerId = args.WorkerId
+				c.tasks[taskId].StartTime = time.Now()
+				reply.Task = task
+				return nil
+			}
+		}
+		c.reduceDone = true
+		for i := c.nMap; i < c.nMap+c.nReduce; i++ {
+			if c.tasks[i].Status != Completed {
+				c.reduceDone = false
+				break
+			}
+		}
+	}
+
+	reply.Task = Task{Type: None}
+	return nil
+}
+
+func (c *Coordinator) TaskDone(args *ReportArgs, reply *ReportReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	taskId := args.TaskNum
+	if args.TaskType == Reduce {
+		taskId += c.nMap
+	}
+
+	if c.tasks[taskId].WorkerId != args.WorkerId {
+		reply.Success = false
+		return nil
+	}
+
+	c.tasks[taskId].Status = Completed
+	reply.Success = true
+	return nil
+}
+\end{lstlisting}
+
+\subsubsection{Explanation}
+The \texttt{coordinator.go} file is the backbone of the MapReduce system, implementing the \texttt{Coordinator} struct and its associated methods. The coordinator is responsible for orchestrating the entire MapReduce workflow, including task assignment, progress tracking, and fault tolerance.
+
+- \texttt{Structs}:
+  - \texttt{Task}: Represents a MapReduce task, which could be a map or reduce task. Fields include:
+    - \texttt{Type}: Indicates whether the task is a map or reduce task.
+    - \texttt{Num}: The task number.
+    - \texttt{Filename}: The input file for map tasks (empty for reduce tasks).
+    - \texttt{NumReduce} and \texttt{NumMap}: The number of reduce and map tasks.
+  - \texttt{TaskArgs}: Contains the worker’s ID.
+  - \texttt{TaskReply}: Contains the task assigned by the coordinator.
+  - \texttt{ReportArgs}: Contains the worker’s ID, task number, and task type (map or reduce).
+  - \texttt{ReportReply}: Indicates whether the task completion report was successful.
+
+- \texttt{Methods}:
+  - \texttt{server()}: Initializes an RPC server over a Unix socket (generated by \texttt{coordinatorSock()}). It registers the coordinator for RPC calls, removes any existing socket file, and starts an HTTP server in a goroutine to handle worker requests.
+  - \texttt{monitor()}: Runs continuously in a goroutine to detect stalled tasks. It locks the mutex, checks each task in progress, and resets tasks to \texttt{Pending} if they exceed a 10-second timeout, enhancing fault tolerance by reassigning failed tasks.
+  - \texttt{Done()}: Returns \texttt{true} when both map and reduce phases are complete, allowing the system to terminate gracefully.
+  - \texttt{MakeCoordinator()}: Constructs a new coordinator instance. It initializes map tasks from input files, creates reduce tasks, sets up task trackers, and launches the monitor and server goroutines.
+  - \texttt{AssignTask()}: An RPC method that assigns tasks to workers. It prioritizes map tasks until all are completed (\texttt{mapDone} becomes \texttt{true}), then assigns reduce tasks. If no tasks are available, it returns a \texttt{None} task type. The method updates task status and tracks worker assignment.
+  - \texttt{TaskDone()}: An RPC method that marks a task as completed. It validates the worker’s ID and updates the task status to \texttt{Completed}. If the report is valid, it returns \texttt{true}, signaling success.
+
+\subsection{rpc.go}
+\begin{lstlisting}
+package mr
+
+import (
+	"net/rpc"
+)
+
+type Task struct {
+	Type      TaskType
+	Num       int
+	Filename  string
+	NumReduce int
+	NumMap    int
+}
+
+type TaskArgs struct {
+	WorkerId string
+}
+
+type TaskReply struct {
+	Task Task
+}
+
+type ReportArgs struct {
+	WorkerId string
+	TaskNum  int
+	TaskType TaskType
+}
+
+type ReportReply struct {
+	Success bool
+}
+
+type TaskType int
+
+const (
+	Map TaskType = iota
+	Reduce
+	None
+)
+
+func call(rpcname string, args interface{}, reply interface{}) bool {
+	client, err := rpc.DialHTTP("unix", coordinatorSock())
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+
+	err = client.Call(rpcname, args, reply)
+	if err != nil {
+		return false
+	}
+	return true
+}
+\end{lstlisting}
+
+\subsubsection{Explanation}
+The \texttt{rpc.go} file defines the data structures used for remote procedure calls (RPCs) between the coordinator and the workers. It also contains the \texttt{call()} function to facilitate communication with the coordinator.
+
+- \texttt{Structs}:
+  - \texttt{Task}: Represents a MapReduce task, which could be a map or reduce task. Fields include:
+    - \texttt{Type}: Indicates whether the task is a map or reduce task.
+    - \texttt{Num}: The task number.
+    - \texttt{Filename}: The input file for map tasks (empty for reduce tasks).
+    - \texttt{NumReduce} and \texttt{NumMap}: The number of reduce and map tasks.
+  - \texttt{TaskArgs}: Contains the worker’s ID.
+  - \texttt{TaskReply}: Contains the task assigned by the coordinator.
+  - \texttt{ReportArgs}: Contains the worker’s ID, task number, and task type (map or reduce).
+  - \texttt{ReportReply}: Indicates whether the task completion report was successful.
+  - \texttt{TaskType}: An enumeration defining the three possible types of tasks: Map, Reduce, and None.
+
+- \texttt{Function}:
+  - \texttt{call()}: This function is used by workers to send RPC requests to the coordinator. It opens a connection to the coordinator via a Unix socket and sends the RPC call. If the call is successful, it returns \texttt{true}, otherwise \texttt{false}.
+
+\subsection{worker.go}
+\begin{lstlisting}
+package mr
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+)
+
+func worker() {
+	for {
+		var args TaskArgs
+		var reply TaskReply
+		if !call("Coordinator.AssignTask", &args, &reply) {
+			log.Fatal("Call to Coordinator failed!")
+		}
+
+		task := reply.Task
+		if task.Type == None {
+			return
+		}
+
+		if task.Type == Map {
+			// Perform Map Task
+			err := doMapTask(task)
+			if err != nil {
+				log.Printf("Map task failed: %v", err)
+				continue
+			}
+		} else if task.Type == Reduce {
+			// Perform Reduce Task
+			err := doReduceTask(task)
+			if err != nil {
+				log.Printf("Reduce task failed: %v", err)
+				continue
+			}
+		}
+
+		var reportArgs ReportArgs
+		var reportReply ReportReply
+		reportArgs.WorkerId = args.WorkerId
+		reportArgs.TaskNum = task.Num
+		reportArgs.TaskType = task.Type
+
+		if !call("Coordinator.TaskDone", &reportArgs, &reportReply) {
+			log.Fatal("Call to Coordinator failed!")
+		}
+
+		if !reportReply.Success {
+			log.Printf("Failed to report task completion for task %d", task.Num)
+		}
+	}
+}
+\end{lstlisting}
+
+\subsubsection{Explanation}
+The \texttt{worker.go} file implements the worker's behavior. It continuously requests tasks from the coordinator, processes them, and reports the completion back to the coordinator.
+
+- \texttt{worker()}: The worker function enters an infinite loop where it:
+  - Calls the \texttt{Coordinator.AssignTask} RPC to request a task.
+  - If the task is \texttt{None}, it terminates.
+  - Depending on the task type (map or reduce), it calls the respective function (\texttt{doMapTask()} or \texttt{doReduceTask()}) to perform the task.
+  - After completing the task, it calls \texttt{Coordinator.TaskDone} to report the completion of the task.
+
+\section{Test Output and Analysis}
+The output generated by running the test script \texttt{Test} demonstrates the proper functioning of the MapReduce system, as each worker completes its assigned task (either map or reduce) and reports the completion to the coordinator.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{test_output.jpg}
+    \caption{Test Output}
+    \label{fig:test_output}
+\end{figure}
+
+\end{document}
