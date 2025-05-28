@@ -1,5 +1,9 @@
 # 🗂️ MapReduce in Go
 
+- Mohammad Saeid Sedighi
+- Mahdi Khesali
+- Mohammad Hosein Motaee
+
 ## 📖 Overview
 
 This project is a simplified implementation of the **MapReduce** framework in **Go (Golang)**. Inspired by Google’s MapReduce model, this system demonstrates how to distribute computational tasks across multiple workers using Remote Procedure Calls (RPCs). The project simulates a master-worker architecture where a **Coordinator** delegates `Map` and `Reduce` tasks to available **Workers**.
